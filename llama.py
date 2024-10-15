@@ -169,12 +169,12 @@ class SelfAttention(nn.Module):
         self.wv = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
 
-        self.cache_k = torch.zeros(
-            (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
-        ).to(config.device)
-        self.cache_v = torch.zeros(
-            (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
-        ).to(config.device)
+        # self.cache_k = torch.zeros(
+        #     (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
+        # ).to(config.device)
+        # self.cache_v = torch.zeros(
+        #     (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
+        # ).to(config.device)
 
     def forward(
         self,
@@ -204,20 +204,21 @@ class SelfAttention(nn.Module):
         xq = apply_rotary_embeddings(xq, freqs_complex, x.device)
         xk = apply_rotary_embeddings(xk, freqs_complex, x.device)
 
+        # TODO: will need to disable the cache when training
         # why :batch_size, need to fully understand this part
         # Likely to replace the entire cache with the new values for the current batch
-        self.cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
-        self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
+        # self.cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
+        # self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
 
         # Retrieve the key and value from the cache
         # (batch_size, seq_len, n_kv_heads, head_dim) -> (batch_size, seq_len, n_kv_heads * head_dim)
-        keys = self.cache_k[:batch_size, : start_pos + seq_len]
-        values = self.cache_v[:batch_size, : start_pos + seq_len]
+        # keys = self.cache_k[:batch_size, : start_pos + seq_len]
+        # values = self.cache_v[:batch_size, : start_pos + seq_len]
 
         # repeat the head and query for the key and value
         # TODO: it's computation inefficient, need to optimize code to actually take advantage of grouped query attention
-        keys = repeat_kv(keys, self.n_rep)
-        values = repeat_kv(values, self.n_rep)
+        keys = repeat_kv(xk, self.n_rep)
+        values = repeat_kv(xv, self.n_rep)
 
         # (batch_size, seq_len, n_query_heads, head_dim) -> (batch_size, n_query_heads, seq_len, head_dim)
         # may have some doubt on this, need to understand this
@@ -303,7 +304,12 @@ class Transformer(nn.Module):
         )
 
     # TODO: what is start_pos
-    def forward(self, tokens: torch.Tensor, start_pos: Optional[int] = None):
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        start_pos: Optional[int] = None,
+        targets: Optional[torch.Tensor] = None,
+    ):
         batch_size, seq_len = tokens.shape
 
         # (batch_size, seq_len) -> (batch_size, seq_len, dim)
@@ -318,9 +324,13 @@ class Transformer(nn.Module):
             mask = torch.full((seq_len, seq_len), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=1)
 
+            # Need to understand this part and why it's done
             mask = torch.hstack(
                 [torch.zeros((seq_len, start_pos), device=tokens.device), mask]
             ).type_as(tokens)
+
+            if mask.device.type == torch.device("mps").type:
+                mask = torch.nan_to_num(mask, nan=0.0)
 
         for layer in self.layers:
             tokens = layer(tokens, start_pos, freqs_complex, mask)
@@ -330,4 +340,8 @@ class Transformer(nn.Module):
 
         output = self.output(tokens).float()  # why float ?
 
-        return output
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(output.view(-1, output.size(-1)), targets.view(-1))
+
+        return output, loss

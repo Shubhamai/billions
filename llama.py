@@ -1,4 +1,4 @@
-from dataclasses import dataclasses
+from dataclasses import dataclass
 import math
 from typing import Optional
 import torch
@@ -8,7 +8,7 @@ import torch.nn.functional as F
 # TODO: kv cache, flash attention, gqa, rotary position encoding
 
 
-@dataclasses
+@dataclass
 class LlamaModelConfig:
     dim: int = 2048
     n_layers: int = 16  # ?
@@ -18,19 +18,20 @@ class LlamaModelConfig:
         8  # no, of head for key and value, it's for grouped query attention
     )
 
-    multiple_of: (
-        int  # When using GQA, the total param are reduced, so we add more params to ffn
-    )
-    ffn_dim_multiplier: int  # TODO: not sure what is the purpose of this & multiple_of
+    # When using GQA, the total param are reduced, so we add more params to ffn
+    multiple_of: int = 256
+
+    # TODO: not sure what is the purpose of this & multiple_of
+    ffn_dim_multiplier: Optional[int] = None
 
     vocab_size: int = 128256
     norm_eps: float = 1e-05
-    theta: float = 10000.0  # for rotary position encoding
+    theta: float = 500000  # for rotary position encoding
 
-    max_batch_size: int  # for kv cache
+    max_batch_size: int = 32  # for kv cache
     max_seq_len: int = 2048  # for kv cache
 
-    device: str
+    device: str = None
 
 
 def precompute_theta_pos_freqs(
@@ -104,14 +105,15 @@ class RMSNorm(nn.Module):
 
 def repeat_kv(x: torch.Tensor, n_rep: int):
     batch_size, seq_len, n_kv_heads, head_dim = x.shape
+
     if n_rep == 1:
         return x
     else:
         return (
             # (batch_size, seq_len, n_kv_heads, head_dim) -> (batch_size, seq_len, n_kv_heads, 1, head_dim)
-            x[:, :, None, :, :]
+            x[:, :, :, None, :]
             .expand(batch_size, seq_len, n_kv_heads, n_rep, head_dim)
-            .reshape(batch_size, seq_len, n_kv_heads, n_rep, head_dim)
+            .reshape(batch_size, seq_len, n_kv_heads * n_rep, head_dim)
         )
 
 
@@ -124,17 +126,17 @@ class FeedForward(nn.Module):
         # why this calculation ?
         hidden_dim = int(2 * hidden_dim / 3)
 
-        if config.multiple_of != 0:
-            hidden_dim = config.ffn_dim_multiplier * config.dim
+        if config.ffn_dim_multiplier is not None:
+            hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
 
-        hidden = config.multiple_of * (
+        hidden_dim = config.multiple_of * (
             (hidden_dim + config.multiple_of - 1) // config.multiple_of
         )
 
         # why such configuration ?
-        self.w1 = nn.Linear(config.dim, hidden, bias=False)
-        self.w2 = nn.Linear(hidden, config.dim, bias=False)
-        self.w3 = nn.Linear(config.dim, hidden, bias=False)
+        self.w1 = nn.Linear(config.dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, config.dim, bias=False)
+        self.w3 = nn.Linear(config.dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor):
         swish = F.silu(self.w1(x))
@@ -169,10 +171,10 @@ class SelfAttention(nn.Module):
 
         self.cache_k = torch.zeros(
             (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
-        )
+        ).to(config.device)
         self.cache_v = torch.zeros(
             (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
-        )
+        ).to(config.device)
 
     def forward(
         self,
@@ -219,9 +221,9 @@ class SelfAttention(nn.Module):
 
         # (batch_size, seq_len, n_query_heads, head_dim) -> (batch_size, n_query_heads, seq_len, head_dim)
         # may have some doubt on this, need to understand this
-        xq = xq.permute(1, 2)
-        keys = keys.permute(1, 2)
-        values = values.permute(1, 2)
+        xq = xq.transpose(1, 2)
+        keys = keys.transpose(1, 2)
+        values = values.transpose(1, 2)
 
         # why transpost of keys, need to understand this, need to check if below shape transformation is correct
         # (batch_size, n_query_heads, seq_len, head_dim) @ (batch_size, n_kv_heads, head_dim, seq_len_kv) -> (batch_size, n_query_heads, seq_len, seq_len_kv)
@@ -294,11 +296,14 @@ class Transformer(nn.Module):
         # for rotary position encoding
         # TODO: why *2, and what if this for, explained here https://youtu.be/oM4VmoabDAI?si=seaccUdKC41X43ai&t=1968, but still not sure
         self.freqs_complex = precompute_theta_pos_freqs(
-            config.dim // config.n_heads, config.max_seq_len * 2, device=config.device
+            config.dim // config.n_heads,
+            config.max_seq_len * 2,
+            device=config.device,
+            theta=config.theta,
         )
 
     # TODO: what is start_pos
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: Optional[int] = None):
         batch_size, seq_len = tokens.shape
 
         # (batch_size, seq_len) -> (batch_size, seq_len, dim)
@@ -308,8 +313,17 @@ class Transformer(nn.Module):
         # Retrive the pairs (m, theta) corresponding to the current position [start_pos, start_pos + seq_len]
         freqs_complex = self.freqs_complex[start_pos : start_pos + seq_len]
 
+        mask = None
+        if seq_len > 1:
+            mask = torch.full((seq_len, seq_len), float("-inf"), device=tokens.device)
+            mask = torch.triu(mask, diagonal=1)
+
+            mask = torch.hstack(
+                [torch.zeros((seq_len, start_pos), device=tokens.device), mask]
+            ).type_as(tokens)
+
         for layer in self.layers:
-            tokens = layer(tokens, start_pos, freqs_complex)
+            tokens = layer(tokens, start_pos, freqs_complex, mask)
 
         # RMS norm
         tokens = self.norm(tokens)

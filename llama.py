@@ -121,6 +121,7 @@ class FeedForward(nn.Module):
     def __init__(self, config: LlamaModelConfig):
         super().__init__()
 
+        # why 4 * config.dim
         hidden_dim = 4 * config.dim
 
         # why this calculation ?
@@ -144,6 +145,11 @@ class FeedForward(nn.Module):
         x = swish * x_V
         x = self.w2(x)
         return x
+
+    def init_weights(self, init_std: float):
+        nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
+        for linear in (self.w2, self.w3):
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
 
 
 class SelfAttention(nn.Module):
@@ -175,6 +181,11 @@ class SelfAttention(nn.Module):
         # self.cache_v = torch.zeros(
         #     (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
         # ).to(config.device)
+
+    def init_weights(self, init_std: float):
+        for linear in (self.wq, self.wk, self.wv):
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
 
     def forward(
         self,
@@ -227,16 +238,24 @@ class SelfAttention(nn.Module):
         values = values.transpose(1, 2)
 
         # why transpost of keys, need to understand this, need to check if below shape transformation is correct
-        # (batch_size, n_query_heads, seq_len, head_dim) @ (batch_size, n_kv_heads, head_dim, seq_len_kv) -> (batch_size, n_query_heads, seq_len, seq_len_kv)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # # (batch_size, n_query_heads, seq_len, head_dim) @ (batch_size, n_kv_heads, head_dim, seq_len_kv) -> (batch_size, n_query_heads, seq_len, seq_len_kv)
+        # scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if mask is not None:
-            scores = scores + mask
+        # if mask is not None:
+        #     scores = scores + mask
 
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        # scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 
-        # (batch_size, n_query_heads, seq_len, seq_len_kv) @ (batch_size, n_kv_heads, seq_len_kv, head_dim) -> (batch_size, n_query_heads, seq_len, head_dim)
-        output = torch.matmul(scores, values)
+        # # (batch_size, n_query_heads, seq_len, seq_len_kv) @ (batch_size, n_kv_heads, seq_len_kv, head_dim) -> (batch_size, n_query_heads, seq_len, head_dim)
+        # output = torch.matmul(scores, values)
+
+        # supports flash attention 2, not flash attention 3
+        output = F.scaled_dot_product_attention(
+            xq,
+            keys,
+            values,
+            is_causal=True,  # attn_mask=mask
+        )
 
         # why contiguous, need to understand this
         # (batch_size, n_query_heads, seq_len, head_dim) -> (batch_size, seq_len, n_query_heads, head_dim)
